@@ -1,0 +1,54 @@
+name: Makro monitor
+
+on:
+  schedule:
+    - cron: "*/5 5-22 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Uruchom monitor
+        run: python makro_monitor.py --once
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Zapisz stan i dziennik
+        run: |
+          git config user.name "makro-monitor"
+          git config user.email "makro-monitor@users.noreply.github.com"
+          for f in state.json journal.csv forecasts.json notes.json; do [ -f "$f" ] && git add "$f"; done
+          git diff --staged --quiet || (git commit -m "aktualizacja stanu" && git push)
+      - name: Przygotuj strone
+        run: mkdir site && cp dashboard.html site/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: run
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.d.outputs.page_url }}
+    steps:
+      - id: d
+        uses: actions/deploy-pages@v4
