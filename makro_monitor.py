@@ -69,9 +69,11 @@ def config():
          "interval_minutes": 15, "alert_minutes": [60, 15, 5], "desktop_notifications": True, "forecasts": {},
          "news_window": {"before": 5, "after": 3},
          "news_checklist": ["Zamknij lub zabezpiecz pozycje", "Sprawdź spread i płynność", "Nie wchodź przed pierwszą świecą 5-min po publikacji"],
+         "custom_events": [], "tv_widgets": True, "tv": {}, "sound_lead_sec": 60,
          "morning_briefing": True, "earnings": {}, "price_alerts": [],
          "evening_summary": True, "evening_time": "22:30", "morning_time": "08:00", "port": 8765}
     c.update(load(CFG_PATH, {}))
+    HIGH.update(e["name"] for e in c.get("custom_events", []) if e.get("impact") == "high")
     if os.getenv("GITHUB_ACTIONS"):
         c["desktop_notifications"] = False
     c["fred_api_key"] = os.getenv("FRED_API_KEY", c["fred_api_key"])
@@ -274,7 +276,7 @@ def upcoming(rows, back=0):
             g.setdefault(dt, []).append(r["name"])
         if back and r.get("last"):
             g.setdefault(r["last"], []).append(r["name"])
-    for dt, n in LAST.get("earn", []):
+    for dt, n in LAST.get("earn", []) + custom_events():
         g.setdefault(dt, []).append(n)
     for d in FOMC:
         dt = datetime.combine(date.fromisoformat(d), dtime(14, 0), NY).astimezone(WAW)
@@ -306,6 +308,8 @@ DNI = ["pn", "wt", "śr", "cz", "pt", "sb", "nd"]
 CSS = """
 :root{--bg:#f4f6fa;--card:#fff;--tx:#0f172a;--mu:#64748b;--bd:#e2e8f0;--ac:#2563eb;--up:#15803d;--upb:#dcfce7;--dn:#b91c1c;--dnb:#fee2e2;--am:#b45309;--amb:#fef3c7;--nb:#eef2f7;color-scheme:light}
 @media(prefers-color-scheme:dark){:root{--bg:#0b0f17;--card:#131a26;--tx:#e6ebf3;--mu:#8b97ab;--bd:#243044;--ac:#60a5fa;--up:#4ade80;--upb:#14301f;--dn:#f87171;--dnb:#3a1717;--am:#fbbf24;--amb:#3a2c0e;--nb:#1b2536;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#0b0f17;--card:#131a26;--tx:#e6ebf3;--mu:#8b97ab;--bd:#243044;--ac:#60a5fa;--up:#4ade80;--upb:#14301f;--dn:#f87171;--dnb:#3a1717;--am:#fbbf24;--amb:#3a2c0e;--nb:#1b2536;color-scheme:dark}
+:root[data-theme="light"]{--bg:#f4f6fa;--card:#fff;--tx:#0f172a;--mu:#64748b;--bd:#e2e8f0;--ac:#2563eb;--up:#15803d;--upb:#dcfce7;--dn:#b91c1c;--dnb:#fee2e2;--am:#b45309;--amb:#fef3c7;--nb:#eef2f7;color-scheme:light}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 main{max-width:1560px;margin:0 auto;padding:20px 16px 48px}
@@ -378,12 +382,11 @@ body.f-today .pair{grid-template-columns:minmax(0,1fr)}
 .fc2{width:100%;padding:6px 8px;margin-top:3px;border:1px solid var(--bd);border-radius:7px;background:var(--bg);color:var(--tx);font:inherit}
 #nw{position:fixed;top:0;left:0;right:0;z-index:50;background:var(--dn);color:#fff;padding:10px 16px;text-align:center;font-weight:650}
 #nw[hidden]{display:none}#nw .nl{font-weight:400;font-size:12px;margin-top:3px;opacity:.95}
+.tvbox{height:430px;padding:0;overflow:hidden}.tvh{height:520px}.seg{flex-wrap:wrap}
 """
 
 JS = """
-const e=document.getElementById('nx');
-if(e){const t=+e.dataset.ts*1000;function u(){let s=Math.max(0,Math.floor((t-Date.now())/1000));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);e.textContent=(d?d+' d ':'')+h+' h '+m+' min '+(s%60)+' s'}u();setInterval(u,1000)}
-document.getElementById('sv').onclick=async()=>{const o={};document.querySelectorAll('.fc').forEach(i=>o[i.dataset.sid]=i.value);try{const r=await fetch('/save',{method:'POST',body:JSON.stringify(o)});if(!r.ok)throw 0;location.reload()}catch(x){document.getElementById('svm').textContent='Nie zapisano. Otwórz stronę przez http://localhost:__PORT__ (nie z pliku).'}};
+const $=id=>document.getElementById(id);
 const SS=[{n:'Tokio',tz:'Asia/Tokyo',o:[9,0],c:[15,0],d:[1,2,3,4,5],t:['otwarta','zamknięta'],l:['do zamknięcia','do otwarcia']},
 {n:'Londyn',tz:'Europe/London',o:[8,0],c:[16,30],d:[1,2,3,4,5],t:['otwarta','zamknięta'],l:['do zamknięcia','do otwarcia']},
 {n:'USA (cash)',tz:'America/New_York',o:[9,30],c:[16,0],d:[1,2,3,4,5],t:['otwarta','zamknięta'],l:['do zamknięcia','do otwarcia']},
@@ -391,16 +394,38 @@ const SS=[{n:'Tokio',tz:'Asia/Tokyo',o:[9,0],c:[15,0],d:[1,2,3,4,5],t:['otwarta'
 const WD={Mon:1,Tue:2,Wed:3,Thu:4,Fri:5,Sat:6,Sun:7};
 function lt(tz){const p=Object.fromEntries(new Intl.DateTimeFormat('en-US',{timeZone:tz,weekday:'short',hour:'numeric',minute:'numeric',second:'numeric',hourCycle:'h23'}).formatToParts(new Date()).map(x=>[x.type,x.value]));return{d:WD[p.weekday],s:+p.hour*3600+ +p.minute*60+ +p.second}}
 function fm(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return (h?h+' h ':'')+m+' min '+(s%60)+' s'}
-function ses(){document.getElementById('ses').innerHTML=SS.map(x=>{const l=lt(x.tz),o=x.o[0]*3600+x.o[1]*60,c=x.c[0]*3600+x.c[1]*60;const op=x.d.includes(l.d)&&l.s>=o&&l.s<c;let left=0;if(op)left=c-l.s;else{for(let k=0;k<8;k++){const dd=(l.d-1+k)%7+1;if(x.d.includes(dd)&&(k>0||l.s<o)){left=k*86400+o-l.s;break}}}return '<div class="sc"><b>'+x.n+'</b><span class="pill '+(op?'up':'')+'">'+x.t[op?0:1]+'</span><small>'+x.l[op?0:1]+': '+fm(left)+'</small></div>'}).join('')}
-ses();setInterval(ses,1000);
-const NE=__NEV__,NB=__NB__;
-function nwf(){const el=document.getElementById('nw'),now=Date.now()/1000;const a=NE.find(e=>now>=e.t-NB*60&&now<=e.t+e.a*60);if(!a){el.hidden=true;return}el.hidden=false;const dt=a.t-now;el.querySelector('.nt1').textContent=dt>0?('OKNO NEWSOWE: '+a.n+' za '+fm(Math.ceil(dt))):('PO PUBLIKACJI: '+a.n+' ('+fm(Math.floor(-dt))+' temu), poczekaj na pierwszą świecę 5-min')}
-nwf();setInterval(nwf,1000);
-const M=document.querySelectorAll('.seg button');
-function sm(m){document.body.classList.remove('f-hi','f-today');if(m)document.body.classList.add(m);M.forEach(b=>b.classList.toggle('on',b.dataset.m===m));try{localStorage.setItem('mm',m)}catch(x){}}
-M.forEach(b=>b.onclick=()=>sm(b.dataset.m));let m0='';try{m0=localStorage.getItem('mm')||''}catch(x){}sm(m0);
-const sn=document.getElementById('svn');if(sn)sn.onclick=async()=>{const o={};document.querySelectorAll('.nt-in').forEach(i=>o[i.dataset.k]=i.value);try{const r=await fetch('/note',{method:'POST',body:JSON.stringify(o)});if(!r.ok)throw 0;location.reload()}catch(x){sn.textContent='Nie zapisano (otwórz przez localhost)'}};
-setInterval(()=>{if(!document.activeElement||document.activeElement.tagName!=='INPUT')location.reload()},300000);
+function ses(){const e=$('ses');if(!e)return;e.innerHTML=SS.map(x=>{const l=lt(x.tz),o=x.o[0]*3600+x.o[1]*60,c=x.c[0]*3600+x.c[1]*60;const op=x.d.includes(l.d)&&l.s>=o&&l.s<c;let left=0;if(op)left=c-l.s;else{for(let k=0;k<8;k++){const dd=(l.d-1+k)%7+1;if(x.d.includes(dd)&&(k>0||l.s<o)){left=k*86400+o-l.s;break}}}return '<div class="sc"><b>'+x.n+'</b><span class="pill '+(op?'up':'')+'">'+x.t[op?0:1]+'</span><small>'+x.l[op?0:1]+': '+fm(left)+'</small></div>'}).join('')}
+let ctx=null,sndOn=false;const fired=new Set();try{sndOn=localStorage.getItem('snd')==='1'}catch(x){}
+function enSnd(){if(!ctx){const A=window.AudioContext||window.webkitAudioContext;if(A)ctx=new A()}if(ctx&&ctx.state==='suspended')ctx.resume()}
+function beep(){if(!ctx)return;enSnd();[0,.35,.7].forEach(d=>{const o=ctx.createOscillator(),g=ctx.createGain(),t=ctx.currentTime+d;o.frequency.value=880;o.connect(g);g.connect(ctx.destination);g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.4,t+.02);g.gain.exponentialRampToValueAtTime(.0001,t+.25);o.start(t);o.stop(t+.3)})}
+document.addEventListener('click',()=>{if(sndOn)enSnd()});
+function ne(){try{return JSON.parse($('d1').dataset.ne)}catch(x){return[]}}
+function tick(){const d1=$('d1');if(!d1)return;const now=Date.now()/1000;
+const e=$('nx');if(e){const s=Math.max(0,Math.floor(+e.dataset.ts-now)),d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);e.textContent=(d?d+' d ':'')+h+' h '+m+' min '+(s%60)+' s'}
+const NE=ne(),NB=+d1.dataset.nb||5,LD=+d1.dataset.lead||60,el=$('nw'),a=NE.find(x=>now>=x.t-NB*60&&now<=x.t+x.a*60);
+if(!a)el.hidden=true;else{el.hidden=false;const dt=a.t-now;el.querySelector('.nt1').textContent=dt>0?('OKNO NEWSOWE: '+a.n+' za '+fm(Math.ceil(dt))):('PO PUBLIKACJI: '+a.n+' ('+fm(Math.floor(-dt))+' temu), poczekaj na pierwszą świecę 5-min')}
+if(sndOn&&ctx)NE.forEach(x=>{const dt=x.t-now;if(dt<=LD&&dt>LD-15&&!fired.has(x.t)){fired.add(x.t);beep()}});
+ses()}
+function eff(){const t=document.documentElement.dataset.theme;return t||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')}
+function thl(){const b=$('thb'),t=document.documentElement.dataset.theme;if(b)b.textContent='Motyw: '+(t==='dark'?'ciemny':t==='light'?'jasny':'auto')}
+function thc(){const c=document.documentElement.dataset.theme||'',n=c===''?'dark':c==='dark'?'light':'';if(n)document.documentElement.dataset.theme=n;else delete document.documentElement.dataset.theme;try{n?localStorage.setItem('th',n):localStorage.removeItem('th')}catch(x){}thl();tv()}
+function tv(){const r=$('tv');if(!r)return;const th=eff(),mk=(id,src,cfg)=>{const c=$(id);if(!c)return;c.innerHTML='';const w=document.createElement('div');w.className='tradingview-widget-container';w.style.height='100%';const i=document.createElement('div');i.className='tradingview-widget-container__widget';i.style.height='100%';w.appendChild(i);const s=document.createElement('script');s.src='https://s3.tradingview.com/external-embedding/'+src;s.async=true;s.text=JSON.stringify(cfg);w.appendChild(s);c.appendChild(w)};
+const base={autosize:true,theme:th,locale:'pl',timezone:'Europe/Warsaw',style:'1',allow_symbol_change:false,hide_side_toolbar:true,calendar:false,interval:r.dataset.int};
+mk('tv-nq','embed-widget-advanced-chart.js',Object.assign({},base,{symbol:r.dataset.nq}));
+mk('tv-au','embed-widget-advanced-chart.js',Object.assign({},base,{symbol:r.dataset.gold}));
+mk('tv-ev','embed-widget-events.js',{width:'100%',height:'100%',colorTheme:th,isTransparent:false,locale:'pl',importanceFilter:'0,1',countryFilter:'us'});
+mk('tv-hm','embed-widget-stock-heatmap.js',{exchanges:[],dataSource:'NASDAQ100',grouping:'sector',blockSize:'market_cap_basic',blockColor:'change',locale:'pl',colorTheme:th,hasTopBar:false,isDataSetEnabled:false,isZoomEnabled:true,hasSymbolTooltip:true,isMonoSize:false,width:'100%',height:'100%'})}
+let cur='';try{cur=localStorage.getItem('mm')||''}catch(x){}
+function sm(m){cur=m;document.body.classList.remove('f-hi','f-today');if(m)document.body.classList.add(m);document.querySelectorAll('.seg button[data-m]').forEach(b=>b.classList.toggle('on',b.dataset.m===m));try{localStorage.setItem('mm',m)}catch(x){}}
+async function post(u,o,btn,msg){try{const r=await fetch(u,{method:'POST',body:JSON.stringify(o)});if(!r.ok)throw 0;location.reload()}catch(x){btn.textContent=msg}}
+function bind(){document.querySelectorAll('.seg button[data-m]').forEach(b=>b.onclick=()=>sm(b.dataset.m));
+const sv=$('sv');if(sv)sv.onclick=async()=>{const o={};document.querySelectorAll('.fc').forEach(i=>o[i.dataset.sid]=i.value);try{const r=await fetch('/save',{method:'POST',body:JSON.stringify(o)});if(!r.ok)throw 0;location.reload()}catch(x){$('svm').textContent='Nie zapisano. Otwórz stronę przez http://localhost:__PORT__ (nie z pliku).'}};
+const sn=$('svn');if(sn)sn.onclick=()=>{const o={};document.querySelectorAll('.nt-in').forEach(i=>o[i.dataset.k]=i.value);post('/note',o,sn,'Nie zapisano (otwórz przez localhost)')};
+const tb=$('thb');if(tb)tb.onclick=thc;
+const sb=$('snb');if(sb){sb.textContent='Dźwięk: '+(sndOn?'wł.':'wył.');sb.onclick=()=>{sndOn=!sndOn;try{localStorage.setItem('snd',sndOn?'1':'0')}catch(x){}sb.textContent='Dźwięk: '+(sndOn?'wł.':'wył.');if(sndOn){enSnd();beep()}}}
+sm(cur);thl()}
+async function refresh(){const a=document.activeElement;if(a&&a.tagName==='INPUT')return;try{const r=await fetch(location.href,{cache:'no-store'});if(!r.ok)throw 0;const d=new DOMParser().parseFromString(await r.text(),'text/html');['d1','d2'].forEach(id=>{const n=d.getElementById(id),o=$(id);if(n&&o){o.innerHTML=n.innerHTML;if(id==='d1'){['ne','lead','nb'].forEach(k=>o.dataset[k]=n.dataset[k])}}});bind()}catch(x){if(location.protocol==='file:')location.reload()}}
+bind();tv();tick();setInterval(tick,1000);setInterval(refresh,300000);
 """
 
 
@@ -451,6 +476,8 @@ def build_calendar(rows):
         groups.setdefault((date.fromisoformat(s), "20:00", "f"), []).append("FOMC (decyzja)")
     for dt, n in LAST.get("earn", []):
         groups.setdefault((dt.date(), dt.strftime("%H:%M"), "e"), []).append(n)
+    for dt, n in custom_events():
+        groups.setdefault((dt.date(), dt.strftime("%H:%M"), "n"), []).append(n)
     ev = {}
     for (d, t, k), names in sorted(groups.items(), key=lambda x: (x[0][0], x[0][1])):
         kk = "h" if k == "n" and any(x in HIGH for x in names) else k
@@ -508,6 +535,27 @@ def build_recent(rows):
         f"<div>{val(r['now'], r['unit'])}</div><div class='sg'>{pills(r)}</div></div>" for r in items)
     return (f"<div class='card'><h2>Ostatnie wydarzenia (14 dni)</h2>{lines}"
             "<small>Dane z FRED mogą pojawiać się z opóźnieniem po publikacji.</small></div>")
+
+
+def custom_events():
+    out = []
+    for e in CFG.get("custom_events", []):
+        try:
+            out.append((datetime.combine(date.fromisoformat(e["date"]), dtime.fromisoformat(e.get("time", "00:00")), WAW), e["name"]))
+        except Exception:
+            pass
+    return out
+
+
+def build_tv():
+    if not CFG.get("tv_widgets", True):
+        return ""
+    tv, q = CFG.get("tv", {}), lambda k, d: html.escape(str(tv.get(k, d)), quote=True)
+    return (f'<div id="tv" data-nq="{q("nq", "OANDA:NAS100USD")}" data-gold="{q("gold", "OANDA:XAUUSD")}" data-int="{q("interval", "5")}">'
+            '<div class="cols sec"><div class="card tvbox" id="tv-nq"></div><div class="card tvbox" id="tv-au"></div></div>'
+            '<div class="cols sec"><div class="card tvbox tvh" id="tv-ev"></div><div class="card tvbox tvh" id="tv-hm"></div></div>'
+            '<small>Wykresy, kalendarz z konsensusem i mapa sektorów to widżety TradingView (dane mogą być opóźnione, a instrumenty CFD '
+            'mogą różnić się od kontraktów futures).</small></div>')
 
 
 def fnum(v):
@@ -586,15 +634,20 @@ def render(rows, px, errors):
     nev = [{"t": int(dt.timestamp()), "n": shorten(n, 4), "a": 30 if "FOMC (decyzja)" in n else nw.get("after", 3)}
            for dt, n in upcoming(rows, back=40) if any(x in HIGH for x in n)]
     chk = " · ".join(html.escape(x) for x in CFG.get("news_checklist", []))
-    js = (JS.replace("__PORT__", str(CFG.get("port", 8765))).replace("__NEV__", json.dumps(nev))
-          .replace("__NB__", str(nw.get("before", 5))))
+    js = JS.replace("__PORT__", str(CFG.get("port", 8765)))
+    nev_attr = html.escape(json.dumps(nev), quote=True)
+    lead, nb = CFG.get("sound_lead_sec", 60), nw.get("before", 5)
     page = f"""<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Makro USA → NQ100 i złoto</title><style>{CSS}</style></head><body><div id="nw" hidden><div class="nt1"></div><div class="nl">{chk}</div></div><main>
-<header><div><h1>Makro USA → NQ100 i złoto</h1><small>Dane: FRED · godziny w czasie polskim</small></div><div style="text-align:right"><div class="seg"><button data-m="">Wszystko</button><button data-m="f-hi">Tylko ważne</button><button data-m="f-today">Dziś</button></div><small>Aktualizacja: {now}</small></div></header>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Makro USA → NQ100 i złoto</title><script>try{{const t=localStorage.getItem('th');if(t)document.documentElement.dataset.theme=t}}catch(e){{}}</script><style>{CSS}</style></head><body><div id="nw" hidden><div class="nt1"></div><div class="nl">{chk}</div></div><main>
+<div class="dyn" id="d1" data-ne='{nev_attr}' data-lead='{lead}' data-nb='{nb}'>
+<header><div><h1>Makro USA → NQ100 i złoto</h1><small>Dane: FRED · godziny w czasie polskim</small></div><div style="text-align:right"><div class="seg"><button data-m="">Wszystko</button><button data-m="f-hi">Tylko ważne</button><button data-m="f-today">Dziś</button><button id="snb">Dźwięk: wył.</button><button id="thb">Motyw: auto</button></div><small>Aktualizacja: {now}</small></div></header>
 <div class="kpis">{cards}</div>{err}
 <div class="card sec"><h2>Sesje i przerwa CME (odliczanie)</h2><div class="ses" id="ses"></div></div>
 <div class="cols sec">{build_agenda(rows)}{build_recent(rows)}</div>
 <div class="sec">{build_levels(rows)}</div>
+</div>
+{build_tv()}
+<div class="dyn" id="d2">
 <div class="pair sec"><div class="card sec tb"><h2>Publikacje makro</h2>
 <div class="rh"><span>Wskaźnik</span><span>Odczyt</span><span>Sygnał</span><span>Trend</span><span>Twoja prognoza</span><span>Następna</span></div>
 {''.join(row(r) for r in pub)}
@@ -603,6 +656,7 @@ def render(rows, px, errors):
 <div class="rh daily"><span>Wskaźnik</span><span>Wartość</span><span>Sygnał</span><span>Trend</span></div>
 {''.join(row(r) for r in mkt)}</div></div>
 {build_stats()}<div class="cals sec">{build_calendar(rows)}</div>
+</div>
 <p class="sec"><small>NQ ▲/▼ i Au ▲/▼ to typowa reakcja na odczyt względem prognozy lub poprzedniego odczytu. To uproszczony schemat, nie rekomendacja.</small></p>
 </main><script>{js}</script></body></html>"""
     with open(OUT_PATH, "w", encoding="utf-8") as f:
