@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor makro USA -> NQ100 i złoto.
-Dane: FRED API (darmowy klucz). Opcjonalnie: yfinance (ceny NQ/złoto), Telegram (alerty).
-Uruchomienie:  python makro_monitor.py        (pętla, odświeża co interval_minutes)
-               python makro_monitor.py --once (jednorazowo)
-Wynik: dashboard.html obok skryptu (sam odświeża się w przeglądarce).
-"""
-import os, re, sys, csv, json, time, calendar, threading, subprocess, html, urllib.request, urllib.parse
+import os, re, sys, csv, importlib.util, webbrowser, json, time, calendar, threading, subprocess, html, urllib.request, urllib.parse
 from datetime import datetime, date, timedelta, time as dtime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
@@ -17,13 +11,11 @@ LOG_PATH = os.path.join(BASE, "monitor.log")
 CFG, LAST = {"port": 8765}, {"rows": [], "px": [], "errors": []}
 MEGA = ["NVDA", "MSFT", "AAPL", "AMZN", "META", "GOOGL"]
 PAST, RAW, PXV, SP, LEV = {}, {}, {}, {}, {}
+LEVT, SRC = {"t": None}, {}
+HAS_YF = importlib.util.find_spec("yfinance") is not None
 PXT, FMPC = {"t": None}, {"ts": 0, "ev": [], "err": ""}
 
 NOTES_PATH = os.path.join(BASE, "notes.json")
-CLOSED = {"2026-01-01": "Nowy Rok", "2026-01-19": "MLK Day", "2026-02-16": "Presidents Day", "2026-04-03": "Wielki Piątek",
-          "2026-05-25": "Memorial Day", "2026-06-19": "Juneteenth", "2026-07-03": "Dzień Niepodległości (obs.)",
-          "2026-09-07": "Labor Day", "2026-11-26": "Thanksgiving", "2026-12-25": "Boże Narodzenie"}
-EARLY = {"2026-11-27": "Skrócona sesja (do 19:00 PL)", "2026-12-24": "Skrócona sesja (do 19:00 PL)"}
 HIGH = {"CPI", "Core CPI", "NFP", "Stopa bezrobocia", "Core PCE", "FOMC (decyzja)"} | {f"{x} (wyniki)" for x in MEGA}
 OFFS = (0, 5, 15, 60)
 NY, WAW = ZoneInfo("America/New_York"), ZoneInfo("Europe/Warsaw")
@@ -52,7 +44,8 @@ IND = [
     ("VXN (zmienność NQ)",  "VXNCLS",   "level", 0, 1,    "pkt",    None, None,         True),
     ("GVZ (zmienność złota)", "GVZCLS",  "level", 0, 1,    "pkt",    None, None,         True),
 ]
-FOMC = ["2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09"]
+FOMC = ["2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+        "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09", "2027-07-28", "2027-09-15", "2027-10-27", "2027-12-08", "2028-01-26"]
 MONTHS = ["", "Styczeń", "Luty", "Marzec", "Kwiecień", "Maj", "Czerwiec", "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień"]
 PRICES = {"NQ=F": "NQ100 (futures)", "GC=F": "Złoto (futures)"}
 
@@ -72,10 +65,11 @@ def config():
          "news_checklist": ["Zamknij lub zabezpiecz pozycje", "Sprawdź spread i płynność", "Nie wchodź przed pierwszą świecą 5-min po publikacji"],
          "custom_events": [], "tv_widgets": True, "tv": {}, "sound_lead_sec": 60,
          "fmp_api_key": "", "page_refresh_sec": None,
-         "morning_briefing": True, "earnings": {}, "price_alerts": [],
+         "fomc_dates": [], "open_browser": False, "morning_briefing": True, "earnings": {}, "price_alerts": [],
          "evening_summary": True, "evening_time": "22:30", "morning_time": "08:00", "port": 8765}
     c.update(load(CFG_PATH, {}))
     HIGH.update(e["name"] for e in c.get("custom_events", []) if e.get("impact") == "high")
+    FOMC.extend(d for d in c.get("fomc_dates", []) if d not in FOMC)
     if os.getenv("GITHUB_ACTIONS"):
         c["desktop_notifications"] = False
     c["fred_api_key"] = os.getenv("FRED_API_KEY", c["fred_api_key"])
@@ -88,8 +82,14 @@ def config():
 def fred(cfg, path, **p):
     p.update(api_key=cfg["fred_api_key"], file_type="json")
     url = f"https://api.stlouisfed.org/fred/{path}?{urllib.parse.urlencode(p)}"
-    with urllib.request.urlopen(url, timeout=20) as r:
-        return json.load(r)
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(url, timeout=25) as r:
+                return json.load(r)
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(2 * (attempt + 1))
 
 
 def series_m(cfg, ind, limit):
@@ -227,6 +227,8 @@ def hot():
 
 def refresh_prices(cfg):
     px = prices()
+    if HAS_YF:
+        set_src("yfinance", bool(px), "" if px else "brak danych")
     if px and LAST["rows"]:
         LAST["px"] = px
         PXT["t"] = datetime.now(WAW)
@@ -254,14 +256,46 @@ def fmp_events(cfg):
         FMPC.update(ev=[], err=f"Brak dostępu lub błąd ({type(ex).__name__}). Sprawdź klucz i plan FMP.")
 
 
+def set_src(name, ok, msg=""):
+    SRC[name] = {"ok": ok, "t": datetime.now(WAW), "msg": msg}
+
+
+def track(cfg, state, name, ok):
+    f = state.setdefault("fail", {})
+    if ok:
+        if f.get(name, 0) >= 3:
+            notify(cfg, f"✅ {name}: dane znów działają")
+        f[name] = 0
+    else:
+        f[name] = f.get(name, 0) + 1
+        if f[name] == 3:
+            notify(cfg, f"⚠️ {name}: brak danych od 3 cykli. Sprawdź połączenie lub klucz.")
+
+
+def build_src():
+    chips = ""
+    for n, v in SRC.items():
+        t, m = v["t"].strftime("%H:%M:%S"), (" · " + html.escape(v["msg"]) if v["msg"] else "")
+        if v["ok"] is None:
+            chips += f"<span class='pill'>{n}: {html.escape(v['msg'])}</span>"
+        elif v["ok"]:
+            chips += f"<span class='pill up'>{n} ✓ {t}{m}</span>"
+        else:
+            chips += f"<span class='pill dn'>{n} ✗ {html.escape(v['msg'])}</span>"
+    return f"<div class='card sec src'><small>Stan źródeł danych:</small>{chips}</div>" if chips else ""
+
+
 def telegram(cfg, text):
     if not (cfg["telegram_token"] and cfg["telegram_chat_id"]):
+        set_src("Telegram", None, "nie skonfigurowano")
         return
     try:
         data = urllib.parse.urlencode({"chat_id": cfg["telegram_chat_id"], "text": text}).encode()
         urllib.request.urlopen(f"https://api.telegram.org/bot{cfg['telegram_token']}/sendMessage", data, timeout=20)
+        set_src("Telegram", True)
     except Exception as e:
-        print("Telegram:", e)
+        set_src("Telegram", False, type(e).__name__)
+        print("Telegram:", type(e).__name__)
 
 
 def desktop(title, text):
@@ -412,13 +446,17 @@ svg{vertical-align:middle}
 .seg{display:flex;gap:6px;justify-content:flex-end;margin-bottom:6px}.seg button.on{background:var(--ac);color:#fff;border-color:var(--ac)}
 body.f-hi .r[data-hi="0"]{display:none}body.f-today .sx{display:none}body.f-today .r[data-td="0"]{display:none}
 .ev.x{background:transparent;border:1px dashed var(--bd);color:var(--mu)}.nt-in{width:100%;min-width:160px;padding:5px 7px;border:1px solid var(--bd);border-radius:7px;background:var(--bg);color:var(--tx);font:inherit}
-.pair,.cals{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(0,1fr);gap:12px;align-items:start}
+.pair,.cals{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(0,1fr);gap:12px;align-items:stretch}
 .cals{grid-template-columns:1fr 1fr}
 .pair>.sec,.cals>.sec{margin-top:0}
 @media(max-width:1450px){.pair,.cals{grid-template-columns:minmax(0,1fr)}.pair>.sec+.sec,.cals>.sec+.sec{margin-top:14px}}
-.pair .r.daily,.pair .rh.daily{grid-template-columns:minmax(110px,1.3fr) minmax(90px,1fr) auto 84px}
+.pair .r.daily,.pair .rh.daily{grid-template-columns:minmax(120px,1.4fr) minmax(96px,1fr) 128px 92px}
 @media(max-width:1450px){.pair .r.daily,.pair .rh.daily{grid-template-columns:minmax(150px,1.6fr) minmax(120px,1fr) minmax(160px,1.3fr) 124px}}
 .tr svg{max-width:100%}
+.pair>.card,.cols>.card{display:flex;flex-direction:column}
+.pair>.card>.r,.cols>.card>.ag{flex:1 1 auto}
+.cols>.card>.it{flex:1 1 auto;align-content:center}
+.pair>.card>.foot{margin-top:auto}
 body.f-today .pair{grid-template-columns:minmax(0,1fr)}
 .rc3{grid-template-columns:minmax(130px,1.3fr) auto minmax(0,1fr);align-items:center}.rc3 .sg small{display:none}
 .ses{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.sc{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
@@ -431,6 +469,8 @@ body.f-today .pair{grid-template-columns:minmax(0,1fr)}
 .lv{display:flex;justify-content:space-between;gap:10px;padding:5px 8px;border-top:1px solid var(--bd);font-variant-numeric:tabular-nums}
 .lv-p{background:var(--ac);color:#fff;font-weight:700;border-radius:6px;border-top-color:transparent}.lv-p small{color:#fff}
 .lv-r{background:var(--dnb)}.lv-s{background:var(--upb)}.hl{margin:8px 0;padding-left:20px;font-size:13px;line-height:1.55}
+.src{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 12px}body.f-compact .xc,body.f-compact .sx{display:none}
+.ev.w{background:var(--amb);color:var(--am);border:0;font-weight:600}.notice div{margin-top:6px}
 .warnb{background:var(--amb);color:var(--am);padding:8px 12px;margin:0 16px 8px;border-radius:8px;font-size:13px}
 @media(max-width:700px){
 .cal{grid-template-columns:1fr;min-width:0}.cal .dh,.cal .d:not(.has){display:none}.cal .d{min-height:0}
@@ -471,7 +511,7 @@ mk('tv-au','embed-widget-advanced-chart.js',Object.assign({},base,{symbol:r.data
 mk('tv-ev','embed-widget-events.js',{width:'100%',height:'100%',colorTheme:th,isTransparent:false,locale:'pl',importanceFilter:'0,1',countryFilter:'us'});
 mk('tv-hm','embed-widget-stock-heatmap.js',{exchanges:[],dataSource:'NASDAQ100',grouping:'sector',blockSize:'market_cap_basic',blockColor:'change',locale:'pl',colorTheme:th,hasTopBar:false,isDataSetEnabled:false,isZoomEnabled:true,hasSymbolTooltip:true,isMonoSize:false,width:'100%',height:'100%'})}
 let cur='';try{cur=localStorage.getItem('mm')||''}catch(x){}
-function sm(m){cur=m;document.body.classList.remove('f-hi','f-today');if(m)document.body.classList.add(m);document.querySelectorAll('.seg button[data-m]').forEach(b=>b.classList.toggle('on',b.dataset.m===m));try{localStorage.setItem('mm',m)}catch(x){}}
+function sm(m){cur=m;document.body.classList.remove('f-hi','f-today','f-compact');if(m)document.body.classList.add(m);document.querySelectorAll('.seg button[data-m]').forEach(b=>b.classList.toggle('on',b.dataset.m===m));try{localStorage.setItem('mm',m)}catch(x){}}
 async function post(u,o,btn,msg){try{const r=await fetch(u,{method:'POST',body:JSON.stringify(o)});if(!r.ok)throw 0;location.reload()}catch(x){btn.textContent=msg}}
 function bind(){document.querySelectorAll('.seg button[data-m]').forEach(b=>b.onclick=()=>sm(b.dataset.m));
 const sv=$('sv');if(sv)sv.onclick=async()=>{const o={};document.querySelectorAll('.fc').forEach(i=>o[i.dataset.sid]=i.value);try{const r=await fetch('/save',{method:'POST',body:JSON.stringify(o)});if(!r.ok)throw 0;location.reload()}catch(x){$('svm').textContent='Nie zapisano. Otwórz stronę przez http://localhost:__PORT__ (nie z pliku).'}};
@@ -484,29 +524,149 @@ bind();tv();tick();setInterval(tick,1000);(function lp(){setTimeout(async()=>{aw
 """
 
 
+def nth_wd(y, m, wd, n):
+    if n > 0:
+        d = date(y, m, 1)
+        return d + timedelta(days=(wd - d.weekday()) % 7 + 7 * (n - 1))
+    d = date(y, 12, 31) if m == 12 else date(y, m + 1, 1) - timedelta(days=1)
+    return d - timedelta(days=(d.weekday() - wd) % 7)
+
+
+def easter(y):
+    a, b, c = y % 19, y // 100, y % 100
+    d, e, f = b // 4, b % 4, (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    t = h + l - 7 * m + 114
+    return date(y, t // 31, t % 31 + 1)
+
+
+def obs(d):
+    return d - timedelta(days=1) if d.weekday() == 5 else d + timedelta(days=1) if d.weekday() == 6 else d
+
+
+def nyse(y):
+    cl = {}
+    if date(y, 1, 1).weekday() != 5:
+        cl[obs(date(y, 1, 1))] = "Nowy Rok"
+    cl[nth_wd(y, 1, 0, 3)] = "MLK Day"
+    cl[nth_wd(y, 2, 0, 3)] = "Presidents Day"
+    cl[easter(y) - timedelta(days=2)] = "Wielki Piątek"
+    cl[nth_wd(y, 5, 0, -1)] = "Memorial Day"
+    cl[obs(date(y, 6, 19))] = "Juneteenth"
+    cl[obs(date(y, 7, 4))] = "Dzień Niepodległości"
+    cl[nth_wd(y, 9, 0, 1)] = "Labor Day"
+    tg = nth_wd(y, 11, 3, 4)
+    cl[tg] = "Thanksgiving"
+    cl[obs(date(y, 12, 25))] = "Boże Narodzenie"
+    early = {tg + timedelta(days=1): "Skrócona sesja (do 19:00 PL)"}
+    for d in (date(y, 7, 3), date(y, 12, 24)):
+        if d.weekday() < 5 and d not in cl and (d.month != 7 or date(y, 7, 4).weekday() < 5):
+            early[d] = "Skrócona sesja (do 19:00 PL)"
+    return cl, early
+
+
 def specials(y):
     out = {}
     add = lambda d, t: out.setdefault(d, []).append(t)
-    for k, v in CLOSED.items():
-        add(date.fromisoformat(k), "Giełda zamknięta: " + v)
-    for k, v in EARLY.items():
-        add(date.fromisoformat(k), v)
+    cl, early = nyse(y)
+    for d, v in cl.items():
+        add(d, "Giełda zamknięta: " + v)
+    for d, v in early.items():
+        add(d, v)
     for m in range(1, 13):
         d = date(y, m, 15)
         d += timedelta(days=(4 - d.weekday()) % 7)
-        if d.isoformat() in CLOSED:
+        if d in cl:
             d -= timedelta(days=1)
         if m % 3 == 0:
-            add(d, "Wygaśnięcie NQ + OpEx kwartalny")
+            add(d, "Triple witching: wygaśnięcie kontraktów i opcji (NQ, indeksy, akcje)")
+            if m == 12:
+                add(d, "Rekonstrukcja Nasdaq-100 (zwykle w grudniu)")
             add(d - timedelta(days=8), "Rollover NQ (zwykle)")
         else:
             add(d, "OpEx miesięczny")
+    for m in (3, 6, 9, 12):
+        d, n = date(y, m, 31 if m in (3, 12) else 30), 0
+        while n < 2:
+            if d.weekday() < 5 and d not in cl:
+                add(d, "Koniec kwartału (rebalansing portfeli)")
+                n += 1
+            d -= timedelta(days=1)
     return out
 
 
 def sp(d):
     SP.setdefault(d.year, specials(d.year))
     return SP[d.year].get(d, [])
+
+
+DESC = {
+    "Triple witching": "Wygasają kontrakty i opcje na indeksy oraz akcje. Zwykle większy wolumen i zmienność, szczególnie w ostatniej godzinie sesji USA. Ruchy bywają techniczne i niezwiązane z newsami.",
+    "Rekonstrukcja": "Coroczna zmiana składu Nasdaq-100. Fundusze indeksowe przestawiają portfele, co może dać duży wolumen przy zamknięciu sesji.",
+    "OpEx": "Wygasają miesięczne opcje. Cena bywa przyciągana do okrągłych poziomów (tzw. pinning) lub gwałtownie od nich odskakuje.",
+    "Rollover": "Okres zmiany kontraktu NQ na kolejny termin. Mogą być różnice cen i płynności między kontraktami, więc sprawdź, który handlujesz.",
+    "Skrócona": "Giełda zamyka się wcześniej. Płytsza płynność i możliwe nietypowe ruchy.",
+    "Giełda zamknięta": "Brak sesji cash w USA. Futures mogą mieć skrócone godziny i niską płynność.",
+    "Koniec kwartału": "Rebalansing portfeli i window dressing mogą powodować nietypowe ruchy, zwłaszcza pod koniec sesji.",
+    "Tydzień NFP": "Tydzień z raportem o zatrudnieniu. Rynek często pozycjonuje się przed publikacją, a sam odczyt bywa najsilniejszym impulsem tygodnia. Uważaj na szerokie spready o 14:30.",
+    "Tydzień FOMC": "Tydzień z decyzją Fed. Przed komunikatem rynek bywa ostrożny, a po decyzji i konferencji (20:30) częste są gwałtowne zwroty.",
+    "Tydzień triple witching": "Tydzień wygasania kontraktów i opcji. Rosnąca zmienność i płynność przesuwają się w kierunku piątku.",
+}
+
+
+def short_sp(t):
+    t = re.sub(r"\s*\(.*?\)", "", t)
+    if t.startswith("Giełda zamknięta: "):
+        return "Zamknięte: " + t.split(": ", 1)[1]
+    return t.split(":")[0].replace("Rekonstrukcja Nasdaq-100", "Rekonstrukcja NDX").strip()
+
+
+def desc_for(text):
+    return next((v for k, v in DESC.items() if text.startswith(k) or k in text), "")
+
+
+def nfp_dates(rows):
+    ds = set()
+    for r in rows:
+        if r["name"] == "NFP":
+            ds.update(dt.date() for dt in r.get("all", []))
+            if r.get("last"):
+                ds.add(r["last"].date())
+    if not ds:
+        for y in range(date.today().year - 1, date.today().year + 2):
+            for m in range(1, 13):
+                d = date(y, m, 1)
+                ds.add(d + timedelta(days=(4 - d.weekday()) % 7))
+    return ds
+
+
+def week_flags(d, rows):
+    mon = d - timedelta(days=d.weekday())
+    days = [mon + timedelta(days=i) for i in range(7)]
+    out = []
+    if any(x in nfp_dates(rows) for x in days):
+        out.append("Tydzień NFP")
+    if any(x.isoformat() in FOMC for x in days):
+        out.append("Tydzień FOMC")
+    if any(t.startswith("Triple witching") for x in days for t in sp(x)):
+        out.append("Tydzień triple witching")
+    return [(lab, DESC[lab]) for lab in out]
+
+
+def build_notices(rows):
+    today = datetime.now(WAW).date()
+    lines = []
+    for k, lab in ((0, "Dziś"), (1, "Jutro")):
+        for t in sp(today + timedelta(days=k)):
+            lines.append(f"<div><b>{lab}: {html.escape(t)}</b><br><small>{html.escape(desc_for(t))}</small></div>")
+    for k, lab in ((0, "Ten tydzień"), (7, "Przyszły tydzień")):
+        for t, dsc in week_flags(today + timedelta(days=k), rows):
+            lines.append(f"<div><b>{lab}: {t.replace('Tydzień ', '', 1)}</b><br><small>{html.escape(dsc)}</small></div>")
+    return ("<div class='warnb notice' style='margin:12px 0 0'><b>⚠ Nietypowe dni na rynku</b>" + "".join(lines) + "</div>") if lines else ""
 
 
 def dpl(d):
@@ -528,7 +688,8 @@ def build_calendar(rows):
         for dt in r.get("all", []):
             groups.setdefault((dt.date(), dt.strftime("%H:%M"), "n"), []).append(r["name"])
     for s in FOMC:
-        groups.setdefault((date.fromisoformat(s), "20:00", "f"), []).append("FOMC (decyzja)")
+        dt = datetime.combine(date.fromisoformat(s), dtime(14, 0), NY).astimezone(WAW)
+        groups.setdefault((dt.date(), dt.strftime("%H:%M"), "f"), []).append("FOMC (decyzja)")
     for dt, n in LAST.get("earn", []):
         groups.setdefault((dt.date(), dt.strftime("%H:%M"), "e"), []).append(n)
     for dt, n in custom_events():
@@ -549,7 +710,9 @@ def build_calendar(rows):
                 continue
             items = "".join(f"<div class='ev {kk}' title='{html.escape(full)}'><b>{t}</b> {html.escape(n)}</div>"
                             for t, n, full, kk in ev.get(d, []))
-            items += "".join(f"<div class='ev x'>{html.escape(t)}</div>" for t in sp(d))
+            items += "".join(f"<div class='ev x' title='{html.escape(t + '. ' + desc_for(t), quote=True)}'>{html.escape(short_sp(t))}</div>" for t in sp(d))
+            if d.weekday() == 0:
+                items += "".join(f"<div class='ev x w' title='{html.escape(dsc, quote=True)}'>{lab}</div>" for lab, dsc in week_flags(d, rows))
             cls = "d" + (" t" if d == today else "") + (" wk" if d.weekday() >= 5 else "") + (" has" if items else "")
             cells += f"<div class='{cls}' data-l='{dpl(d)}'><span class='num'>{d.day}</span>{items}</div>"
         out.append(f"<div class='card sec sx'><h2>Kalendarz: {MONTHS[mm]} {yy} (czas PL)</h2>"
@@ -608,7 +771,7 @@ def build_tv():
     tv, q = CFG.get("tv", {}), lambda k, d: html.escape(str(tv.get(k, d)), quote=True)
     return (f'<div id="tv" data-nq="{q("nq", "OANDA:NAS100USD")}" data-gold="{q("gold", "OANDA:XAUUSD")}" data-int="{q("interval", "5")}">'
             '<div class="cols sec"><div class="card tvbox" id="tv-nq"></div><div class="card tvbox" id="tv-au"></div></div>'
-            '<div class="cols sec"><div class="card tvbox tvh" id="tv-ev"></div><div class="card tvbox tvh" id="tv-hm"></div></div>'
+            '<div class="cols sec xc"><div class="card tvbox tvh" id="tv-ev"></div><div class="card tvbox tvh" id="tv-hm"></div></div>'
             '<small>Wykresy, kalendarz z konsensusem i mapa sektorów to widżety TradingView (dane mogą być opóźnione, a instrumenty CFD '
             'mogą różnić się od kontraktów futures).</small></div>')
 
@@ -656,7 +819,7 @@ def build_levels(rows):
             "<li><b>Tydzień high / low:</b> mocniejsze poziomy niż dzienne, rynek reaguje przy nich silniej.</li>"
             "<li><b>Oczekiwany ruch i ATR:</b> ile rynek wycenia (IV) i ile faktycznie przechodzi średnio dziennie. Służą do doboru stopów i celów.</li>"
             "</ul></details>"
-            "<small>Dane z yfinance (opóźnione). Zielone pole to najbliższe wsparcie pod ceną, czerwone to najbliższy opór nad ceną. "
+            f"<small>Dane z yfinance (opóźnione), poziomy pobrano {LEVT['t'].strftime('%H:%M') if LEVT['t'] else '–'}. Zielone pole to najbliższe wsparcie pod ceną, czerwone to najbliższy opór nad ceną. "
             "Poziomy to punkty odniesienia, nie sygnały wejścia.</small></div>")
 
 
@@ -664,12 +827,12 @@ def build_fmp():
     if not CFG.get("fmp_api_key"):
         return ""
     if not FMPC["ev"]:
-        return f"<div class='card sec'><h2>Konsensus (FMP)</h2><small>{html.escape(FMPC['err'] or 'Ładowanie danych...')}</small></div>"
+        return f"<div class='card sec xc'><h2>Konsensus (FMP)</h2><small>{html.escape(FMPC['err'] or 'Ładowanie danych...')}</small></div>"
     f = lambda v: "–" if v is None else html.escape(str(v))
     rows = "".join(f"<tr><td>{dpl(dt)} {dt.strftime('%H:%M')}</td><td>{html.escape(ev)}</td><td>{imp}</td><td>{f(est)}</td>"
                    f"<td>{f(prev)}</td><td>{f(act)}</td></tr>" for dt, ev, imp, est, prev, act in FMPC["ev"])
     rows = labelize(rows, ["Czas (PL)", "Wydarzenie", "Waga", "Konsensus", "Poprzedni", "Faktyczny"])
-    return ("<div class='card sec'><h2>Konsensus i kalendarz USA (FMP)</h2><div class='w'><table class='tbl rs'><tr><th>Czas (PL)</th>"
+    return ("<div class='card sec xc'><h2>Konsensus i kalendarz USA (FMP)</h2><div class='w'><table class='tbl rs'><tr><th>Czas (PL)</th>"
             f"<th>Wydarzenie</th><th>Waga</th><th>Konsensus</th><th>Poprzedni</th><th>Faktyczny</th></tr>{rows}</table></div>"
             "<small>Dane z Financial Modeling Prep, czas przeliczony z UTC (sprawdź przy pierwszym użyciu). Jednostki podaje źródło.</small></div>")
 
@@ -734,16 +897,18 @@ def render(rows, px, errors):
     page = f"""<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Makro USA → NQ100 i złoto</title><script>try{{const t=localStorage.getItem('th');if(t)document.documentElement.dataset.theme=t}}catch(e){{}}</script><style>{CSS}</style></head><body><div id="nw" hidden><div class="nt1"></div><div class="nl">{chk}</div></div><main>
 <div class="dyn" id="d1" data-ne='{nev_attr}' data-lead='{lead}' data-nb='{nb}' data-ref='{ref}'>
-<header><div><h1>Makro USA → NQ100 i złoto</h1><small>Dane: FRED · godziny w czasie polskim</small></div><div style="text-align:right"><div class="seg"><button data-m="">Wszystko</button><button data-m="f-hi">Tylko ważne</button><button data-m="f-today">Dziś</button><button id="snb">Dźwięk: wył.</button><button id="thb">Motyw: auto</button></div><small>Aktualizacja: {now}</small></div></header>
+<header><div><h1>Makro USA → NQ100 i złoto</h1><small>Dane: FRED · godziny w czasie polskim</small></div><div style="text-align:right"><div class="seg"><button data-m="">Wszystko</button><button data-m="f-hi">Tylko ważne</button><button data-m="f-today">Dziś</button><button data-m="f-compact">Kompakt</button><button id="snb">Dźwięk: wył.</button><button id="thb">Motyw: auto</button></div><small>Aktualizacja: {now}</small></div></header>
 <div class="kpis">{cards}</div>{err}
+{build_src()}
+{build_notices(rows)}
 <div class="card sec"><h2>Sesje i przerwa CME (odliczanie)</h2><div class="ses" id="ses"></div></div>
-<div class="cols sec">{build_agenda(rows)}{build_recent(rows)}</div>
+<div class="cols sec xc">{build_agenda(rows)}{build_recent(rows)}</div>
 <div class="sec">{build_levels(rows)}</div>
 {build_fmp()}
 </div>
 {build_tv()}
 <div class="dyn" id="d2">
-<div class="pair sec"><div class="card sec tb"><h2>Publikacje makro</h2>
+<div class="pair sec xc"><div class="card sec tb"><h2>Publikacje makro</h2>
 {warn}
 <div class="rh"><span>Wskaźnik</span><span>Odczyt</span><span>Sygnał</span><span>Trend</span><span>Konsensus (wpisz)</span><span>Następna</span></div>
 {''.join(row(r) for r in pub)}
@@ -751,7 +916,7 @@ def render(rows, px, errors):
 <div class="card sec tb sx"><h2>Rynek na bieżąco (dane dzienne, opóźnienie ok. 1 dnia)</h2>
 <div class="rh daily"><span>Wskaźnik</span><span>Wartość</span><span>Sygnał</span><span>Trend</span></div>
 {''.join(row(r) for r in mkt)}</div></div>
-{build_stats()}<div class="cals sec">{build_calendar(rows)}</div>
+{build_stats()}<div class="cals sec xc">{build_calendar(rows)}</div>
 </div>
 <p class="sec"><small>NQ ▲/▼ i Au ▲/▼ to typowa reakcja na odczyt względem prognozy lub poprzedniego odczytu. To uproszczony schemat, nie rekomendacja.</small></p>
 </main><script>{js}</script></body></html>"""
@@ -964,7 +1129,7 @@ def morning(cfg, ev, state):
         return
     state["briefing"] = today
     items = [(dt, n) for dt, n in ev if dt.date() == now.date()]
-    spt = sp(now.date())
+    spt = sp(now.date()) + [lab for lab, _ in week_flags(now.date(), LAST["rows"])]
     if not items and not spt:
         return
     hi = lambda n: any(x in HIGH for x in n)
@@ -990,7 +1155,7 @@ class Handler(BaseHTTPRequestHandler):
             with open(OUT_PATH, "rb") as f:
                 data = f.read()
         except Exception:
-            data = "Brak danych, poczekaj na pierwsze odświeżenie.".encode()
+            data = "<meta charset=utf-8><meta http-equiv=refresh content=5><body style='font-family:sans-serif'>Trwa pobieranie danych. Strona odświeży się sama za chwilę...".encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -1082,6 +1247,18 @@ def cycle(cfg):
     fmp_events(cfg)
     LEV.clear()
     LEV.update(levels())
+    LEVT["t"] = datetime.now(WAW)
+    set_src("FRED", bool(rows), (f"{len(errors)} wskaźn. z błędem" if rows and errors else errors[0] if errors else ""))
+    track(cfg, state, "FRED", bool(rows))
+    if HAS_YF:
+        set_src("yfinance", bool(px), "" if px else "brak danych")
+        track(cfg, state, "yfinance", bool(px))
+    else:
+        set_src("yfinance", None, "nie zainstalowano")
+    if cfg.get("fmp_api_key"):
+        set_src("FMP", bool(FMPC["ev"]) or None, FMPC["err"][:60])
+    if "Telegram" not in SRC and cfg["telegram_token"] and cfg["telegram_chat_id"]:
+        set_src("Telegram", None, "skonfigurowany")
     LAST.update(rows=rows, px=px, errors=errors, earn=earnings(cfg, state))
     ev = upcoming(rows)
     send_alerts(cfg, ev, state)
@@ -1164,7 +1341,7 @@ def autostart(remove=False):
         py = pyw
     with open(bat, "w", encoding="utf-8") as f:
         f.write(f'@echo off\r\nchcp 65001 >nul\r\ntimeout /t 20 /nobreak >nul\r\n'
-                f'start "" "{py}" "{os.path.abspath(__file__)}"\r\nexit\r\n')
+                f'start "" "{py}" "{os.path.abspath(__file__)}" --open\r\nexit\r\n')
     print("Dodano do autostartu:", bat, "\nProgram uruchomi się sam po zalogowaniu (logi: monitor.log). "
           "Aby wyłączyć: python makro_monitor.py --remove-autostart")
 
@@ -1186,8 +1363,12 @@ def main():
             print("UWAGA: brak danych Telegrama, alerty nigdzie nie trafią.")
         return cycle(cfg)
     start_server(cfg)
+    want_open = "--open" in sys.argv or cfg.get("open_browser")
     while True:
         ev = cycle(cfg)
+        if want_open:
+            webbrowser.open(f"http://localhost:{cfg['port']}")
+            want_open = False
         lastpx = [time.time()]
         end = time.time() + max(1, cfg["interval_minutes"]) * 60
         while time.time() < end:
